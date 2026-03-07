@@ -1,0 +1,76 @@
+create or replace function public.sync_auth_plan_metadata(p_user_id uuid, p_plan text)
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  normalized_plan text;
+  usage_row public.billing_usage%rowtype;
+  runs_remaining integer;
+begin
+  if p_user_id is null then
+    raise exception 'p_user_id is required';
+  end if;
+
+  normalized_plan := lower(trim(coalesce(p_plan, '')));
+  if normalized_plan not in ('free', 'pro') then
+    raise exception 'Unsupported plan: %', p_plan;
+  end if;
+
+  select *
+  into usage_row
+  from public.billing_usage
+  where user_id = p_user_id;
+
+  if normalized_plan = 'free' then
+    runs_remaining := greatest(coalesce(usage_row.analyses_limit, 5) - coalesce(usage_row.analyses_used, 0), 0);
+
+    update auth.users u
+    set raw_app_meta_data =
+      (coalesce(u.raw_app_meta_data, '{}'::jsonb) || jsonb_build_object(
+        'plan', normalized_plan,
+        'runs_remaining', runs_remaining
+      )) - 'renewal_at'
+    where u.id = p_user_id;
+  else
+    update auth.users u
+    set raw_app_meta_data =
+      coalesce(u.raw_app_meta_data, '{}'::jsonb) || jsonb_build_object(
+        'plan', normalized_plan,
+        'runs_remaining', null,
+        'renewal_at', coalesce(u.raw_app_meta_data->'renewal_at', 'null'::jsonb)
+      )
+    where u.id = p_user_id;
+  end if;
+end;
+$$;
+revoke all on function public.sync_auth_plan_metadata(uuid, text) from public;
+grant execute on function public.sync_auth_plan_metadata(uuid, text) to service_role;
+create or replace function public.sync_auth_plan_metadata_from_billing_usage()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform public.sync_auth_plan_metadata(new.user_id, new.plan);
+  return new;
+end;
+$$;
+drop trigger if exists trg_billing_usage_sync_auth_plan_metadata on public.billing_usage;
+create trigger trg_billing_usage_sync_auth_plan_metadata
+after insert or update of plan, analyses_used, analyses_limit on public.billing_usage
+for each row execute function public.sync_auth_plan_metadata_from_billing_usage();
+do $$
+declare
+  row_record record;
+begin
+  for row_record in
+    select bu.user_id, bu.plan
+    from public.billing_usage bu
+  loop
+    perform public.sync_auth_plan_metadata(row_record.user_id, row_record.plan);
+  end loop;
+end
+$$;
