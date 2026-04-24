@@ -2,10 +2,17 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
 const GENERATED_RESUMES_TABLE = "generated_resumes";
+const RUNS_TABLE = "resume_runs";
 const FUNCTION_NAME = "compile-tailored-resume-pdf";
 const DEFAULT_BUCKET = "Resumes";
 const DEFAULT_SIGNED_URL_TTL_SECONDS = 3600;
 const MAX_LATEX_BYTES = 200_000;
+const STATUS = {
+  QUEUED_PDF: "queued_pdf",
+  COMPILING_PDF: "compiling_pdf",
+  COMPLETED: "completed",
+  FAILED: "failed",
+};
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -28,6 +35,7 @@ type RequestBody = {
   latex?: unknown;
   filename?: unknown;
   generated_resume_id?: unknown;
+  run_id?: unknown;
 };
 
 function jsonResponse(body: unknown, status = 200) {
@@ -113,13 +121,52 @@ async function sha256Hex(value: string): Promise<string> {
     .join("");
 }
 
+async function markRunStatus(
+  adminClient: ReturnType<typeof createClient>,
+  runId: string,
+  userId: string,
+  status: string,
+) {
+  const { error } = await adminClient
+    .from(RUNS_TABLE)
+    .update({
+      status,
+      error_code: null,
+      error_message: null,
+    })
+    .eq("id", runId)
+    .eq("user_id", userId);
+
+  if (error) {
+    throw new HttpError(500, "RUN_STATUS_UPDATE_FAILED", error.message);
+  }
+}
+
+async function markRunFailure(
+  adminClient: ReturnType<typeof createClient>,
+  runId: string,
+  userId: string,
+  code: string,
+  message: string,
+) {
+  await adminClient
+    .from(RUNS_TABLE)
+    .update({
+      error_code: code,
+      error_message: message,
+    })
+    .eq("id", runId)
+    .eq("user_id", userId);
+}
+
 async function resolveLatex(
   body: RequestBody,
-  userClient: ReturnType<typeof createClient>,
-): Promise<{ latex: string; filename: string; generatedResumeId: string }> {
+  client: ReturnType<typeof createClient>,
+): Promise<{ latex: string; filename: string; generatedResumeId: string; runId: string }> {
   const suppliedLatex = cleanString(body.latex);
   const suppliedFilename = cleanString(body.filename);
   const generatedResumeId = cleanString(body.generated_resume_id);
+  const suppliedRunId = cleanString(body.run_id);
 
   if (suppliedLatex) {
     ensureLatexSize(suppliedLatex);
@@ -127,22 +174,29 @@ async function resolveLatex(
       latex: suppliedLatex,
       filename: sanitizeFilename(suppliedFilename || "tailored-resume.pdf"),
       generatedResumeId,
+      runId: suppliedRunId,
     };
   }
 
-  if (!generatedResumeId) {
+  if (!generatedResumeId && !suppliedRunId) {
     throw new HttpError(
       400,
       "INVALID_INPUT",
-      "Either latex or generated_resume_id is required.",
+      "Either latex, generated_resume_id, or run_id is required.",
     );
   }
 
-  const { data: generatedResume, error } = await userClient
+  let generatedResumeQuery = client
     .from(GENERATED_RESUMES_TABLE)
-    .select("id, filename, latex")
-    .eq("id", generatedResumeId)
-    .single();
+    .select("id, run_id, filename, latex");
+
+  if (generatedResumeId) {
+    generatedResumeQuery = generatedResumeQuery.eq("id", generatedResumeId);
+  } else {
+    generatedResumeQuery = generatedResumeQuery.eq("run_id", suppliedRunId);
+  }
+
+  const { data: generatedResume, error } = await generatedResumeQuery.single();
 
   if (error || !generatedResume) {
     throw new HttpError(404, "GENERATED_RESUME_NOT_FOUND", "Generated resume not found.");
@@ -159,10 +213,14 @@ async function resolveLatex(
     latex,
     filename: sanitizeFilename(suppliedFilename || cleanString(generatedResume.filename) || "tailored-resume.pdf"),
     generatedResumeId,
+    runId: suppliedRunId || cleanString(generatedResume.run_id),
   };
 }
 
 serve(async (req) => {
+  let authenticatedUserId = "";
+  let runId = "";
+
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
@@ -181,19 +239,23 @@ serve(async (req) => {
 
     const authHeader = req.headers.get("Authorization");
     const accessToken = parseBearerToken(authHeader);
+    const isInternalInvocation = accessToken === serviceRoleKey;
 
     const adminClient = createClient(supabaseUrl, serviceRoleKey);
     const userClient = createClient(supabaseUrl, supabaseAnonKey, {
       global: { headers: { Authorization: authHeader ?? "" } },
     });
 
-    const {
-      data: { user },
-      error: userError,
-    } = await adminClient.auth.getUser(accessToken);
+    if (!isInternalInvocation) {
+      const {
+        data: { user },
+        error: userError,
+      } = await adminClient.auth.getUser(accessToken);
 
-    if (userError || !user) {
-      throw new HttpError(401, "UNAUTHORIZED", "Invalid or expired user token.");
+      if (userError || !user) {
+        throw new HttpError(401, "UNAUTHORIZED", "Invalid or expired user token.");
+      }
+      authenticatedUserId = user.id;
     }
 
     let body: RequestBody;
@@ -203,7 +265,48 @@ serve(async (req) => {
       throw new HttpError(400, "INVALID_JSON", "Expected JSON body.");
     }
 
-    const { latex, filename, generatedResumeId } = await resolveLatex(body, userClient);
+    const dataClient = isInternalInvocation ? adminClient : userClient;
+    const resolved = await resolveLatex(body, dataClient);
+    const latex = resolved.latex;
+    const filename = resolved.filename;
+    const generatedResumeId = resolved.generatedResumeId;
+    runId = resolved.runId;
+
+    if (runId) {
+      const { data: run, error: runError } = await dataClient
+        .from(RUNS_TABLE)
+        .select("id, user_id, status")
+        .eq("id", runId)
+        .single();
+
+      if (runError || !run) {
+        throw new HttpError(404, "RUN_NOT_FOUND", "Run not found.");
+      }
+
+      if (isInternalInvocation) {
+        authenticatedUserId = cleanString(run.user_id);
+      }
+
+      if (cleanString(run.user_id) !== authenticatedUserId) {
+        throw new HttpError(403, "FORBIDDEN", "Run does not belong to authenticated user.");
+      }
+
+      if (run.status === STATUS.FAILED) {
+        throw new HttpError(409, "RUN_TERMINAL", "Run is in terminal failed state.");
+      }
+
+      if (
+        run.status !== STATUS.QUEUED_PDF &&
+        run.status !== STATUS.COMPILING_PDF &&
+        run.status !== STATUS.COMPLETED
+      ) {
+        throw new HttpError(409, "RUN_NOT_READY", "Run is not ready for PDF compile.");
+      }
+
+      if (run.status !== STATUS.COMPLETED) {
+        await markRunStatus(adminClient, runId, authenticatedUserId, STATUS.COMPILING_PDF);
+      }
+    }
 
     let compileResponse: Response;
     try {
@@ -255,7 +358,7 @@ serve(async (req) => {
     const latexHash = await sha256Hex(latex);
     const storagePath = [
       "generated",
-      user.id,
+      authenticatedUserId,
       `${Date.now()}-${latexHash.slice(0, 12)}-${filename}`,
     ].join("/");
 
@@ -283,6 +386,10 @@ serve(async (req) => {
       throw new HttpError(500, "SIGNED_URL_FAILED", signedUrlError?.message ?? "Could not create signed URL.");
     }
 
+    if (runId) {
+      await markRunStatus(adminClient, runId, authenticatedUserId, STATUS.COMPLETED);
+    }
+
     return jsonResponse(
       {
         ok: true,
@@ -290,6 +397,7 @@ serve(async (req) => {
         path: storagePath,
         signed_url: signed.signedUrl,
         bucket,
+        run_id: runId || null,
         generated_resume_id: generatedResumeId || null,
         compile: {
           engine: compilePayload.engine,
@@ -307,6 +415,16 @@ serve(async (req) => {
     const message = error instanceof HttpError
       ? error.message
       : `Unexpected function error in ${FUNCTION_NAME}.`;
+
+    if (runId && authenticatedUserId) {
+      await markRunFailure(
+        createClient(getEnv("SUPABASE_URL"), getEnv("SUPABASE_SERVICE_ROLE_KEY")),
+        runId,
+        authenticatedUserId,
+        code,
+        message,
+      );
+    }
 
     return jsonResponse(
       {
